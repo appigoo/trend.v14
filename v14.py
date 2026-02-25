@@ -24,18 +24,30 @@ st.markdown("""
 # --- 2. 市場環境診斷 (VIX & SPY) ---
 def get_market_context():
     try:
-        # 抓取 VIX (波動率) 與 SPY (標普500)
-        vix_data = yf.download("^VIX", period="2d", interval="5m", progress=False)
-        spy_data = yf.download("SPY", period="2d", interval="5m", progress=False)
-        vix_price = vix_data['Close'].iloc[-1]
-        vix_prev = vix_data['Close'].iloc[-2]
-        spy_change = ((spy_data['Close'].iloc[-1] - spy_data['Close'].iloc[-2]) / spy_data['Close'].iloc[-2]) * 100
+        # 修正：增加 auto_adjust 并处理 MultiIndex
+        vix_data = yf.download("^VIX", period="5d", interval="1d", progress=False)
+        spy_data = yf.download("SPY", period="5d", interval="1d", progress=False)
+        
+        if isinstance(vix_data.columns, pd.MultiIndex):
+            vix_data.columns = vix_data.columns.get_level_values(0)
+        if isinstance(spy_data.columns, pd.MultiIndex):
+            spy_data.columns = spy_data.columns.get_level_values(0)
+
+        # 獲取最新價格與漲跌幅
+        vix_price = float(vix_data['Close'].iloc[-1])
+        vix_prev = float(vix_data['Close'].iloc[-2])
+        
+        # SPY 漲跌幅改為當日相較於前一收盤價，更具參考性
+        spy_close = float(spy_data['Close'].iloc[-1])
+        spy_prev = float(spy_data['Close'].iloc[-2])
+        spy_change = ((spy_close - spy_prev) / spy_prev) * 100
         
         v_status = "🔴 極端恐慌" if vix_price > 28 else "🟡 波動放大" if vix_price > 20 else "🟢 環境平穩"
         v_trend = "📈 恐慌升溫" if vix_price > vix_prev else "📉 恐慌緩解"
-        return float(vix_price), float(spy_change), v_status, v_trend
-    except:
-        return 20.0, 0.0, "N/A", "N/A"
+        return vix_price, spy_change, v_status, v_trend
+    except Exception as e:
+        # 調試用：st.write(f"Debug Error: {e}") 
+        return 20.0, 0.0, "數據暫時不可用", "N/A"
 
 # --- 3. Telegram 結構化通知系統 ---
 def send_pro_notification(sym, action, res_details, price, pc, vr, adr_u, vix_info, lookback_k):
@@ -44,7 +56,6 @@ def send_pro_notification(sym, action, res_details, price, pc, vr, adr_u, vix_in
         chat_id = st.secrets["TELEGRAM_CHAT_ID"]
         v_val, spy_c, v_stat, v_trend = vix_info
         
-        # 能量與風險診斷
         energy_status = "🔴 體力耗盡 (慎防回踩)" if adr_u > 90 else "🟡 剩餘有限" if adr_u > 70 else "🟢 空間充足"
         market_risk = "⚠️ 高風險環境" if v_val > 25 else "✅ 環境穩定"
 
@@ -80,9 +91,11 @@ def fetch_pro_data(symbol, range_p, interval_p):
     try:
         df = yf.download(symbol, period=range_p, interval=interval_p, progress=False)
         if df.empty: return None
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+        # 修正：處理 yfinance 的多級索引
+        if isinstance(df.columns, pd.MultiIndex): 
+            df.columns = df.columns.get_level_values(0)
         
-        close = df['Close'].squeeze()
+        close = df['Close']
         df['EMA20'] = close.ewm(span=20, adjust=False).mean()
         df['EMA60'] = close.ewm(span=60, adjust=False).mean()
         df['EMA200'] = close.ewm(span=200, adjust=False).mean()
@@ -91,11 +104,14 @@ def fetch_pro_data(symbol, range_p, interval_p):
         # MACD Hist
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
-        df['Hist'] = (ema12 - ema26) - (ema12 - ema26).ewm(span=9, adjust=False).mean()
+        diff = ema12 - ema26
+        df['Hist'] = diff - diff.ewm(span=9, adjust=False).mean()
         
         # ADR 計算
         df_daily = yf.download(symbol, period="14d", interval="1d", progress=False)
         if not df_daily.empty:
+            if isinstance(df_daily.columns, pd.MultiIndex): 
+                df_daily.columns = df_daily.columns.get_level_values(0)
             adr = (df_daily['High'] - df_daily['Low']).mean()
             df['ADR_Usage'] = ((df_daily['High'].iloc[-1] - df_daily['Low'].iloc[-1]) / adr) * 100
         else:
@@ -104,7 +120,7 @@ def fetch_pro_data(symbol, range_p, interval_p):
         return df
     except: return None
 
-# --- 5. 訊號判定邏輯 ---
+# --- 5. 訊號判定邏輯 --- (保持不變)
 def check_signals(df, p_limit, v_limit, use_brk, use_macd, lookback_k):
     if df is None or len(df) < lookback_k + 1: return None, ""
     last = df.iloc[-1]; prev = df.iloc[-2]
@@ -115,15 +131,12 @@ def check_signals(df, p_limit, v_limit, use_brk, use_macd, lookback_k):
     reasons = []
     sig_type = None
 
-    # A. 趨勢過濾
     is_bull_trend = price > last['EMA200'] and last['EMA20'] > last['EMA60']
     is_bear_trend = price < last['EMA200'] and last['EMA20'] < last['EMA60']
     
-    # B. 5K 突破
     is_brk_h = price > df.iloc[-6:-1]['High'].max() if use_brk else False
     is_brk_l = price < df.iloc[-6:-1]['Low'].min() if use_brk else False
 
-    # C. 動態 MACD 反轉 (使用參數 lookback_k)
     m_bull = m_bear = False
     if use_macd:
         hw = df['Hist'].iloc[-(lookback_k + 1):].values
@@ -144,7 +157,7 @@ def check_signals(df, p_limit, v_limit, use_brk, use_macd, lookback_k):
 
     return sig_type, "\n".join(reasons)
 
-# --- 6. 側邊欄 ---
+# --- 6. 側邊欄 --- (保持不變)
 with st.sidebar:
     st.header("🗄️ 交易者工作站")
     sym_input = st.text_input("代碼名單", value="TSLA, NIO, TSLL, XPEV, META, GOOGL, AAPL, NVDA, AMZN, MSFT, TSM, GLD, BTC-USD, QQQ").upper()
@@ -157,7 +170,8 @@ with st.sidebar:
     refresh_rate = st.slider("刷新頻率(秒)", 30, 300, 60)
     
     st.divider()
-    price_alerts = st.text_area("🎯 關鍵價位 (TSLA > 420)", value="")
+    st.subheader("🎯 預警設定")
+    price_alerts = st.text_area("關鍵價位 (TSLA > 420)", value="")
     p_thr = st.number_input("異動閾值(%)", value=1.0)
     v_thr = st.number_input("量爆倍數", value=2.0)
     use_brk = st.checkbox("啟用 5K 突破", True)
@@ -188,9 +202,9 @@ while True:
                     main_df = df
 
                 if main_df is not None:
-                    cur_p = main_df['Close'].iloc[-1]
+                    cur_p = float(main_df['Close'].iloc[-1])
                     cur_pc = ((cur_p - main_df['Close'].iloc[-2]) / main_df['Close'].iloc[-2]) * 100
-                    cur_vr = main_df['Volume'].iloc[-1] / main_df['Vol_Avg'].iloc[-1]
+                    cur_vr = float(main_df['Volume'].iloc[-1] / main_df['Vol_Avg'].iloc[-1]) if main_df['Vol_Avg'].iloc[-1] > 0 else 1.0
                     adr_u = main_df['ADR_Usage'].iloc[-1]
                     
                     # 獨立價格監控
