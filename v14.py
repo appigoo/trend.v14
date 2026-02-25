@@ -27,7 +27,9 @@ def get_market_context():
     try:
         # 抓取 VIX (波動率) 與 SPY (標普500)
         vix_data = yf.download("^VIX", period="2d", interval="5m", progress=False)
-        spy_data = yf.download("SPY", period="2d", interval="5m", progress=False)
+        time.sleep(1)
+        spy_data = yf.Ticker("SPY").history(period="2d", interval="5m", progress=False)
+        #spy_data = yf.download("SPY", period="2d", interval="5m", progress=False)
         vix_price = vix_data['Close'].iloc[-1]
         vix_prev = vix_data['Close'].iloc[-2]
         spy_change = ((spy_data['Close'].iloc[-1] - spy_data['Close'].iloc[-2]) / spy_data['Close'].iloc[-2]) * 100
